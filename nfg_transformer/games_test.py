@@ -37,6 +37,24 @@ class GamesTest(parameterized.TestCase):
     np.testing.assert_allclose(payoffs.std(), 1.0, atol=1e-4)
     np.testing.assert_allclose(mask, 1.0)
 
+  @parameterized.parameters([((16, 16),), ((3, 4),)])
+  def test_zero_sum(self, num_strategies):
+    key = jax.random.PRNGKey(42)
+    payoffs, mask = games.zero_sum(key, num_strategies)
+
+    self.assertEqual(payoffs.shape, (2,) + num_strategies)
+    self.assertEqual(mask.shape, num_strategies)
+    np.testing.assert_allclose(mask, 1.0)
+
+    # Payoffs are zero-sum at every joint action.
+    np.testing.assert_allclose(payoffs.sum(0), 0.0, atol=1e-6)
+    np.testing.assert_allclose(payoffs[1], -payoffs[0])
+
+    # Both players match the moments of `l2_invariant`.
+    for player in range(2):
+      np.testing.assert_allclose(payoffs[player].mean(), 0.0, atol=1e-4)
+      np.testing.assert_allclose(payoffs[player].std(), 1.0, atol=1e-4)
+
   def test_empirical_disc_game(self):
     num_strategies = (16, 16)
     latent_size = 8
@@ -56,6 +74,7 @@ class GamesTest(parameterized.TestCase):
       (games.Game.L2_INVARIANT, (3, 4)),
       (games.Game.L2_INVARIANT, (3, 4, 5)),
       (games.Game.EMPIRICAL_DISC_GAME, (3, 3)),
+      (games.Game.ZERO_SUM, (3, 4)),
   )
   def test_generate_payoffs(self, game, num_strategies):
     generate_payoffs = games.generate_payoffs(game, {}, num_strategies, 4)

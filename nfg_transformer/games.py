@@ -155,6 +155,42 @@ def l2_invariant(
   return payoffs, joint_mask
 
 
+def zero_sum(
+    key: jnp.ndarray, num_strategies: Sequence[int]
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Returns a sampled two-player zero-sum payoff tensor.
+
+  Player 0's payoff matrix is sampled uniformly, centered and L2 normalised,
+  and player 1 receives its negation, so payoffs sum to zero at every joint
+  action. Normalising before negating is what keeps the zero-sum structure
+  exact. The per-player treatment of `l2_invariant` would break it, as each
+  player is centered along a different axis and scaled by a different factor;
+  only a global shift and a global scale preserve zero-sum.
+
+  Both players' payoffs have zero mean and unit variance, matching the moments
+  of `l2_invariant`. The bounds of the uniform sample are divided out by the
+  normalisation and so are arbitrary.
+
+  Args:
+    key: a `jax.random.PRNGKey` instance controlling the randomness of the
+      payoff sampling.
+    num_strategies: the number of strategies for each of the two players.
+
+  Returns:
+    payoffs: the payoff tensor, summing to zero across players at every joint
+      action.
+    mask: an all-ones tensor, as every joint action of a zero-sum game is
+      observed.
+  """
+  assert len(num_strategies) == 2
+  payoff = jax.random.uniform(key, num_strategies, minval=-1.0, maxval=1.0)
+  payoff -= jnp.mean(payoff)
+  payoff = _l2_scale(payoff, unit_variance=True)
+  payoffs = jnp.stack([payoff, -payoff])
+  joint_mask = jnp.ones(num_strategies)
+  return payoffs, joint_mask
+
+
 def empirical_disc_game(
     key: jnp.ndarray,
     num_strategies: Sequence[int],
@@ -186,6 +222,7 @@ def empirical_disc_game(
 class Game(enum.Enum):
   L2_INVARIANT = enum.auto()
   EMPIRICAL_DISC_GAME = enum.auto()
+  ZERO_SUM = enum.auto()
 
 
 def generate_payoffs(
@@ -202,6 +239,8 @@ def generate_payoffs(
       payoffs, mask = l2_invariant(key, num_strategies, **game_settings)
     elif game == Game.EMPIRICAL_DISC_GAME:
       payoffs, mask = empirical_disc_game(key, num_strategies, **game_settings)
+    elif game == Game.ZERO_SUM:
+      payoffs, mask = zero_sum(key, num_strategies, **game_settings)
     else:
       raise ValueError(f'Unrecognised game type: {game}.')
     return payoffs, mask

@@ -125,9 +125,23 @@ masking will break them.
 - [games.py](nfg_transformer/games.py) — payoff tensor samplers. `l2_invariant`
   (centred, L2-normalised random payoffs — the canonical training distribution)
   and `empirical_disc_game` (win-rate games from latent vectors, with a
-  symmetric random joint mask for the reconstruction task).
-  `generate_payoffs()` returns a jitted batch generator that also applies
-  `PositionalSharding` across local devices and threads the PRNG key through.
+  symmetric random joint mask for the reconstruction task), `zero_sum`
+  (two-player only; see below). `generate_payoffs()` returns a jitted batch
+  generator that also applies `PositionalSharding` across local devices and
+  threads the PRNG key through.
+
+  `zero_sum` normalises a *single* uniform matrix, then stacks `[A, -A]` — the
+  negation comes last, so zero-sum holds bit-exactly. Do **not** reuse
+  `_l2_disc` here: it centres each player along a *different* axis and divides
+  each by a *different* scalar, and both break the property. Only a global
+  shift and a global scale preserve zero-sum, which is also why the strategic
+  invariance `l2_invariant` exploits has no zero-sum analogue — the
+  opponent-dependent shift that is free for one player lands on the other as a
+  function of their own action. Payoffs match `l2_invariant`'s moments (per
+  player: mean 0, std 1), so the two classes are drop-in interchangeable in the
+  notebook, but the distribution *shape* differs (bounded/flat vs. Gaussian
+  tails). The uniform sampling bound is divided out by the normalisation and is
+  therefore arbitrary.
 - [equilibria.py](nfg_transformer/equilibria.py) — objectives. `nash_approx`
   returns NashConv (max deviation gain under the product distribution implied by
   per-player marginals) and `max_deviation_gain` returns an MSE loss against the
