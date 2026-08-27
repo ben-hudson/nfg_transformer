@@ -16,6 +16,7 @@
 # @title Implementation for supervised learning experiments for the NfgTransfomer.
 
 import enum
+import os
 import re
 from typing import Mapping
 from typing import Sequence
@@ -25,6 +26,7 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import optax
+import wandb
 
 from nfg_transformer import equilibria
 from nfg_transformer import games
@@ -41,9 +43,57 @@ class Objective(enum.Enum):
     MAX_DEVIATION_GAIN = enum.auto()
 
 
+def dist_to_normal_cone(operator, strategies):
+    """Euclidean distance from ``operator`` to the normal cone of the probability simplex at
+    ``strategies`` (actions on the last dim): the VI stationarity residual, zero exactly where
+    ``strategies`` is a fixed point of the ascent dynamics ``z <- project(z + h operator(z))``.
+
+    The cone at ``z`` is ``{u : u_i = lambda on the support, u_i <= lambda off it}``, so the
+    squared distance is ``min`` over ``lambda`` of the support's squared deviations from ``lambda``
+    plus the off-support upward deviations -- the same sort-and-threshold solve as
+    ``project_onto_simplex``: with the coordinates ordered support-first then by operator value,
+    the minimizing ``lambda`` is the mean of the largest self-consistent active prefix.
+    """
+    support = strategies > 0
+    order = jnp.argsort(jnp.where(support, -jnp.inf, -operator), axis=-1)
+    sorted_operator = jnp.take_along_axis(operator, order, axis=-1)
+
+    positions = jnp.arange(1, operator.shape[-1] + 1)
+    prefix_mean = jnp.cumsum(sorted_operator, axis=-1) / positions
+    active = (positions <= support.sum(axis=-1, keepdims=True)) | (sorted_operator > prefix_mean)
+    multiplier = jnp.take_along_axis(prefix_mean, active.sum(axis=-1, keepdims=True) - 1, axis=-1)
+
+    deviation = jnp.where(support, operator - multiplier, jnp.maximum(operator - multiplier, 0.0))
+    return jnp.sqrt(jnp.square(deviation).sum(axis=-1))
+
+
+def _stationarity_residual(payoffs: jnp.ndarray, marginals: Sequence[jnp.ndarray]) -> jnp.ndarray:
+    """Returns the distance to the normal cone at ``marginals``, as one scalar per game.
+
+    Two-player games with equal action counts only. The operator is each player's
+    expected payoff per action against their opponent's marginal; the two per-player
+    residuals are combined as their L2 norm, which is the distance to the normal cone
+    of the *product* of the players' simplices.
+    """
+    strategies = jnp.stack(marginals)  # [2, T]
+    # Transposing player 1's payoffs puts each player's own action on the first axis.
+    own_payoffs = jnp.stack([payoffs[0], payoffs[1].T])  # [2, T_own, T_opponent]
+    operator = jnp.einsum("pab,pb->pa", own_payoffs, strategies[::-1])
+    return jnp.linalg.norm(dist_to_normal_cone(operator, strategies))
+
+
 ######
 # MODEL & LEARNING RULES
 ######
+
+# Entries of the loss' `extra` that hold one scalar per game and are logged, per
+# objective. Everything else in `extra` is a per-game tensor or a per-player
+# sequence, which only the end-of-run inspection consumes.
+_LOGGED_SCALARS = {
+    Objective.NE: ("dist_to_normal_cone",),
+    Objective.MAX_DEVIATION_GAIN: (),
+    Objective.RECONSTRUCTION: ("inpainting_loss",),
+}
 
 
 def _joint_mask_to_action_masks(mask: jnp.ndarray) -> Sequence[jnp.ndarray]:
@@ -133,10 +183,12 @@ def make_model(
             action_mask = _joint_mask_to_action_masks(masks)
             logits = [jnp.where(m, l, -jnp.inf) for m, l in zip(action_mask, logits)]
             loss, extra = equilibria.nash_approx(payoffs, logits, joint_mask=masks)
+            marginals = [jax.nn.softmax(l) for l in logits]
             extra = dict(
-                marginals=[jax.nn.softmax(l) for l in logits],
+                marginals=marginals,
                 logits=logits,
                 action_mask=action_mask,
+                dist_to_normal_cone=_stationarity_residual(payoffs, marginals),
                 **extra,
             )
         elif objective == Objective.MAX_DEVIATION_GAIN:
@@ -155,9 +207,12 @@ def make_model(
         key, this_key = jax.random.split(key)
         loss_fn = hk.transform(jax.vmap(_loss_fn))
         loss, extra = loss_fn.apply(params, this_key, payoffs, masks)
+        # Batch means of the logged scalars, taken before `extra` is narrowed below
+        # to the first game of the batch for inspection.
+        metrics = {k: jnp.mean(extra[k]) for k in _LOGGED_SCALARS[objective]}
         extra = jax.tree_map(lambda arr: arr[0], extra)
 
-        return jnp.mean(loss), (key, extra)
+        return jnp.mean(loss), (key, dict(metrics=metrics, **extra))
 
     @jax.jit
     def update(params, key, opt_state, payoffs, masks):
@@ -234,7 +289,7 @@ objective = (
 if objective in (Objective.NE, Objective.MAX_DEVIATION_GAIN):
     # Sample batches of payoff tensors from the L2-invariant game subspace.
     generate_payoffs = games.generate_payoffs(
-        games.Game.L2_INVARIANT,
+        games.Game.ZERO_SUM,
         {},
         num_strategies=num_strategies,
         batch_size=batch_size,
@@ -264,14 +319,17 @@ optim = optimiser(
 )
 
 # NfgTransformer(D=64, K=8, A=2)
-initial_params, update, evaluate = make_model(
-    objective=objective,
+model_config = dict(
     num_heads=8,
     num_action_channels=64,
     num_qkv_channels=64,
     num_blocks=8,
     num_self_attend_per_block=2,
+)
+initial_params, update, evaluate = make_model(
+    objective=objective,
     optim=optim,
+    **model_config,
 )
 
 key = hk.PRNGSequence(42)
@@ -284,12 +342,26 @@ opt_state = optim.init(params)
 
 key = next(key)
 
-losses = []
+# Set WANDB_PROJECT to log elsewhere, or WANDB_MODE=offline/disabled to not log.
+run = wandb.init(
+    project=os.environ.get("WANDB_PROJECT", "nfg-transformer"),
+    config=dict(
+        objective=objective.name,
+        max_num_updates=max_num_updates,
+        batch_size=batch_size,
+        num_strategies=num_strategies,
+        **model_config,
+    ),
+)
+
 for i in range(max_num_updates):
     (payoffs, masks), key = generate_payoffs(key)
-    params, key, opt_state, (loss, _) = update(params, key, opt_state, payoffs, masks)
+    params, key, opt_state, (loss, extra) = update(params, key, opt_state, payoffs, masks)
     if i % 1000 == 0:
-        print(f"Iteration {i}: loss = {loss}")
+        # Logging forces a host sync, so it follows the reporting cadence.
+        metrics = jax.device_get(dict(loss=loss, **extra["metrics"]))
+        run.log(metrics, step=i)
+        print(f"Iteration {i}: " + ", ".join(f"{k} = {v:.4f}" for k, v in metrics.items()))
 
 # @title Randomly sample a batch of new payoffs and inspect the outputs.
 import numpy as np
@@ -297,6 +369,10 @@ import numpy as np
 (payoffs, masks), key = generate_payoffs(key)
 
 loss, (key, extra) = evaluate(params, key, payoffs, masks)
+
+final_metrics = jax.device_get(dict(loss=loss, **extra["metrics"]))
+run.summary.update({f"final_{k}": v for k, v in final_metrics.items()})
+run.finish()
 
 print(f"Loss (average): {loss}")
 np.set_printoptions(suppress=True, precision=2, linewidth=180)
